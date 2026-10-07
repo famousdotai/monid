@@ -79,7 +79,7 @@ export default defineEndpoint({
     input: { schema: { body: zBody } },
     timeouts: { requestMs: 60_000, runMs: 2_700_000, pollMs: 2_000 },
     lifecycle: {
-        start: async ({ data, utils }) => {
+        start: async ({ data, utils, logger }) => {
             const res = await utils.request({
                 headers: {
                     ...data.request.headers,
@@ -104,16 +104,46 @@ export default defineEndpoint({
             if (
                 utils.json.optionalGet(res.body, "$.resume") === "add_credits"
             ) {
-                // Queued for credits: SuperCool holds the work up to 24h for
-                // a top-up (`resume_by`), far past this run's budget. Settle
-                // now as out of credits rather than time out unsettled.
-                return {
-                    kind: "COMPLETED",
-                    httpStatus: 402,
-                    providerHttpStatus: res.status,
-                    output: res.body,
-                    state: { externalRunId: id },
-                };
+                // Held for a credit top-up (up to 24h, far past this run's
+                // budget): it would run and bill after a later top-up,
+                // outside this run. Cancel it first (queued work is removed
+                // before it runs) and settle only on the message SuperCool
+                // reports final: a 402 when nothing was used, else the
+                // receipt earlier work drew. Not final yet (the cancel
+                // failed, or a top-up started it first): keep polling; a
+                // poll that sees it held again cancels again (idempotent).
+                const held = await utils.http({
+                    method: "POST",
+                    path: "/v1/messages/" + encodeURIComponent(id) + "/cancel",
+                });
+                if (
+                    held.status < 200 || held.status >= 300 ||
+                    utils.json.optionalGet(held.body, "$.final") !== true
+                ) {
+                    logger.warn(
+                        "supercool held work not settled yet; polling",
+                        {
+                            status: held.status,
+                        },
+                    );
+                    return {
+                        kind: "RUNNING",
+                        state: { externalRunId: id },
+                        pollAfterMs: 30_000,
+                    };
+                }
+                const used = utils.json.optionalNum(
+                    held.body,
+                    "$.credits_used",
+                );
+                return used !== undefined && used > 0
+                    ? { kind: "COMPLETED", httpStatus: 200, output: held.body }
+                    : {
+                        kind: "COMPLETED",
+                        httpStatus: 402,
+                        providerHttpStatus: res.status,
+                        output: held.body,
+                    };
             }
             if (utils.json.optionalGet(res.body, "$.final") !== true) {
                 return { kind: "RUNNING", state: { externalRunId: id } };
@@ -176,13 +206,39 @@ export default defineEndpoint({
             if (
                 utils.json.optionalGet(res.body, "$.resume") === "add_credits"
             ) {
-                // Queued for credits (see start): settle as out of credits.
-                return {
-                    kind: "COMPLETED",
-                    httpStatus: 402,
-                    providerHttpStatus: res.status,
-                    output: res.body,
-                };
+                // Held for a credit top-up: cancel, then settle (see start).
+                const held = await utils.http({
+                    method: "POST",
+                    path: "/v1/messages/" + encodeURIComponent(id) + "/cancel",
+                });
+                if (
+                    held.status < 200 || held.status >= 300 ||
+                    utils.json.optionalGet(held.body, "$.final") !== true
+                ) {
+                    logger.warn(
+                        "supercool held work not settled yet; polling",
+                        {
+                            status: held.status,
+                        },
+                    );
+                    return {
+                        kind: "RUNNING",
+                        state: { externalRunId: id },
+                        pollAfterMs: 30_000,
+                    };
+                }
+                const used = utils.json.optionalNum(
+                    held.body,
+                    "$.credits_used",
+                );
+                return used !== undefined && used > 0
+                    ? { kind: "COMPLETED", httpStatus: 200, output: held.body }
+                    : {
+                        kind: "COMPLETED",
+                        httpStatus: 402,
+                        providerHttpStatus: res.status,
+                        output: held.body,
+                    };
             }
             if (utils.json.optionalGet(res.body, "$.final") !== true) {
                 return { kind: "RUNNING" };
@@ -211,6 +267,54 @@ export default defineEndpoint({
                     : { providerHttpStatus: res.status }),
                 output: res.body,
             };
+        },
+        /** Cancel (`POST /v1/messages/{id}/cancel`): queued work is
+         *  removed, this message's own running work is stopped, and work
+         *  started after it is cancelled as it arrives. Credits already used
+         *  stay on the message, so a final message SETTLES its receipt here
+         *  (the stopped work drew them); one that isn't final yet is read
+         *  again briefly, then left UNRESOLVED for the host to reconcile. */
+        stop: async ({ data, utils, logger }) => {
+            const id = data.lifecycle.state.externalRunId;
+            if (id === undefined) {
+                throw Object.assign(
+                    new Error("SuperCool stop without a message id in state"),
+                    { retriable: false },
+                );
+            }
+            const res = await utils.http({
+                method: "POST",
+                path: "/v1/messages/" + encodeURIComponent(id) + "/cancel",
+            });
+            if (res.status < 200 || res.status >= 300) {
+                logger.warn("supercool cancel failed", { status: res.status });
+                return {
+                    kind: "UNRESOLVED",
+                    reason: "cancel answered " + String(res.status),
+                };
+            }
+            let body = res.body;
+            for (
+                let i = 0;
+                i < 3 && utils.json.optionalGet(body, "$.final") !== true;
+                i++
+            ) {
+                const read = await utils.http({
+                    method: "GET",
+                    path: "/v1/messages/" + encodeURIComponent(id) +
+                        "?wait=20",
+                });
+                if (read.status >= 200 && read.status < 300) {
+                    body = read.body;
+                }
+            }
+            if (utils.json.optionalGet(body, "$.final") !== true) {
+                return {
+                    kind: "UNRESOLVED",
+                    reason: "work still running on SuperCool after cancel",
+                };
+            }
+            return { kind: "COMPLETED", httpStatus: 200, output: body };
         },
     },
     usage: {

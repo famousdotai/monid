@@ -3,10 +3,12 @@ import { fromFileUrl } from "@std/path";
 import type { Json } from "@shared/core";
 import {
     liveSkip,
+    loadEndpoint,
     loadFixture,
     runEndpoint,
     testSealedUnit,
 } from "@shared/testing";
+import { RunKind, StopKind } from "@shared/core";
 import { directTransport, Engine } from "@monid/connector-engine";
 
 const ID = "supercool#v1/messages";
@@ -109,12 +111,37 @@ Deno.test("supercool: the input schema rejects before the wire", async () => {
     );
 });
 
-Deno.test("supercool: work queued for credits settles as a 402 instead of polling into a timeout", async () => {
+Deno.test("supercool: work queued for credits is cancelled, then settles as a 402", async () => {
+    // Cancelled first, so a later top-up can't run and bill it outside the run.
     const result = await run("synthetic-queued-for-credits");
     assertEquals(result.httpStatus, 402);
     assertEquals(result.providerHttpStatus, 200);
     assertEquals(result.isProviderError, true);
     assertEquals(result.usage, { credits: {}, evidence: {} });
+    const raw = (result.output as { raw: Record<string, unknown> }).raw;
+    assertEquals([raw.status, raw.reason, raw.final], [
+        "failed",
+        "cancelled",
+        true,
+    ]);
+});
+
+Deno.test("supercool: held work after paid work settles the receipt the earlier work drew", async () => {
+    const result = await run("synthetic-held-after-paid-work");
+    assertEquals(result.httpStatus, 200);
+    assertEquals(result.usage, {
+        credits: { default: 3.5 },
+        evidence: { CREDIT: 350 },
+    });
+});
+
+Deno.test("supercool: held work a top-up started first is polled to its real end", async () => {
+    const result = await run("synthetic-held-cancel-not-final");
+    assertEquals(result.httpStatus, 200);
+    assertEquals(result.usage, {
+        credits: { default: 9.25 },
+        evidence: { CREDIT: 925 },
+    });
 });
 
 Deno.test("supercool: the schema gate passes five https files and the message unchanged", async () => {
@@ -165,4 +192,29 @@ Deno.test({
         assertEquals(output.credits_used, undefined); // plucked as the receipt
         assert(typeof result.usage.evidence.CREDIT === "number");
     },
+});
+
+const stopWith = async (name: string, runId: string) => {
+    const loaded = await loadEndpoint({
+        unit: await testSealedUnit(ID),
+        input: INPUT,
+        mode: "replay",
+        fixture: await loadFixture(`${fixturesDir}${name}.json`),
+    });
+    const run = { runId };
+    const started = await loaded.start(INPUT, run);
+    assert(started.kind === RunKind.RUNNING);
+    return await loaded.stop(INPUT, started.state, run);
+};
+
+Deno.test("supercool: stop cancels the message and settles the credits the work already drew", async () => {
+    const stopped = await stopWith("synthetic-stop-settled", "test-stop-1");
+    assert(stopped.kind === RunKind.COMPLETED, "stop settles");
+    assertEquals(stopped.usage.credits, { default: 6.5 });
+    assertEquals(stopped.usage.evidence, { CREDIT: 650 });
+});
+
+Deno.test("supercool: stop that can't see the work end is UNRESOLVED", async () => {
+    const stopped = await stopWith("synthetic-stop-unresolved", "test-stop-2");
+    assertEquals(stopped.kind, StopKind.UNRESOLVED);
 });
