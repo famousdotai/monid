@@ -2,10 +2,13 @@ import { defineEndpoint, Unit, UsageModelKind } from "@shared/core";
 import { z } from "zod";
 
 const zFile = z.strictObject({
-    url: z.string().url().describe(
-        "A public https URL SuperCool downloads the file from (an image, " +
-            "a logo, a PDF brief, a video).",
-    ),
+    // SuperCool fetches attachments over https only (any other scheme comes
+    // back as an unfetched file in `notes`), so the mirror refuses it first.
+    url: z.string().url().regex(/^https:\/\//, "must be an https URL")
+        .describe(
+            "A public https URL SuperCool downloads the file from (an image, " +
+                "a logo, a PDF brief, a video).",
+        ),
     name: z.string().min(1).max(200).optional().describe(
         "The file name the agent sees.",
     ),
@@ -41,6 +44,12 @@ const zBody = z.strictObject({
  * (the account is out of credits, or at its running-work cap), `failed`
  * and `expired` are failures under a matching HTTP status; the engine
  * zero-bills them.
+ *
+ * QUEUED FOR CREDITS. An account out of credits gets its work queued, not
+ * refused: `status: "blocked"`, `final: false`, `resume: "add_credits"`,
+ * held up to 24 hours (`resume_by`) for a top-up. That is far past this
+ * run's budget, so the run settles at once as a 402 (nothing has been
+ * drawn yet) instead of polling into a TIMEOUT with no receipt.
  */
 export default defineEndpoint({
     meta: {
@@ -59,7 +68,7 @@ export default defineEndpoint({
             "status means the agent asked a question: send the answer as a " +
             "new message. Billing is the SuperCool credits the work " +
             "actually used, reported on every message as `credits_used`.",
-        docsUrl: "https://supercool.com/api",
+        docsUrl: "https://supercool.com/docs/api",
         categories: ["agents", "video-generation", "image-generation"],
         notes: [
             "Download links are signed and expire; save files you need.",
@@ -91,6 +100,20 @@ export default defineEndpoint({
                     new Error("SuperCool returned no message id"),
                     { retriable: false },
                 );
+            }
+            if (
+                utils.json.optionalGet(res.body, "$.resume") === "add_credits"
+            ) {
+                // Queued for credits: SuperCool holds the work up to 24h for
+                // a top-up (`resume_by`), far past this run's budget. Settle
+                // now as out of credits rather than time out unsettled.
+                return {
+                    kind: "COMPLETED",
+                    httpStatus: 402,
+                    providerHttpStatus: res.status,
+                    output: res.body,
+                    state: { externalRunId: id },
+                };
             }
             if (utils.json.optionalGet(res.body, "$.final") !== true) {
                 return { kind: "RUNNING", state: { externalRunId: id } };
@@ -147,6 +170,17 @@ export default defineEndpoint({
                 return {
                     kind: "COMPLETED",
                     httpStatus: res.status,
+                    output: res.body,
+                };
+            }
+            if (
+                utils.json.optionalGet(res.body, "$.resume") === "add_credits"
+            ) {
+                // Queued for credits (see start): settle as out of credits.
+                return {
+                    kind: "COMPLETED",
+                    httpStatus: 402,
+                    providerHttpStatus: res.status,
                     output: res.body,
                 };
             }

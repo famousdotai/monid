@@ -1,7 +1,13 @@
-import { assertEquals, assertRejects } from "@std/assert";
+import { assert, assertEquals, assertRejects } from "@std/assert";
 import { fromFileUrl } from "@std/path";
 import type { Json } from "@shared/core";
-import { loadFixture, runEndpoint, testSealedUnit } from "@shared/testing";
+import {
+    liveSkip,
+    loadFixture,
+    runEndpoint,
+    testSealedUnit,
+} from "@shared/testing";
+import { directTransport, Engine } from "@monid/connector-engine";
 
 const ID = "supercool#v1/messages";
 const fixturesDir = fromFileUrl(new URL("./fixtures/", import.meta.url));
@@ -89,6 +95,10 @@ Deno.test("supercool: the input schema rejects before the wire", async () => {
         "file without a URL",
     );
     await rejects(
+        { message: "hi", files: [{ url: "http://example.com/a.png" }] },
+        "file URL that isn't https",
+    );
+    await rejects(
         {
             message: "hi",
             files: Array.from({ length: 6 }, (_, i) => ({
@@ -97,4 +107,62 @@ Deno.test("supercool: the input schema rejects before the wire", async () => {
         },
         "more than 5 files",
     );
+});
+
+Deno.test("supercool: work queued for credits settles as a 402 instead of polling into a timeout", async () => {
+    const result = await run("synthetic-queued-for-credits");
+    assertEquals(result.httpStatus, 402);
+    assertEquals(result.providerHttpStatus, 200);
+    assertEquals(result.isProviderError, true);
+    assertEquals(result.usage, { credits: {}, evidence: {} });
+});
+
+Deno.test("supercool: the schema gate passes five https files and the message unchanged", async () => {
+    const sent: Json[] = [];
+    const engine = new Engine({
+        transport: directTransport({
+            params: () => Promise.resolve({ apiKey: "test-key" }),
+            fetch: (_input, init) => {
+                sent.push(JSON.parse(String(init?.body)));
+                return Promise.resolve(
+                    new Response(
+                        JSON.stringify({
+                            error: "unauthorized",
+                            message: "stop here",
+                        }),
+                        {
+                            status: 401,
+                            headers: { "content-type": "application/json" },
+                        },
+                    ),
+                );
+            },
+        }),
+    });
+    const files = Array.from({ length: 5 }, (_, i) => ({
+        url: `https://example.com/${i}.png`,
+        name: `${i}.png`,
+    }));
+    const loaded = await engine.load(await testSealedUnit(ID));
+    await loaded.run({ body: { message: "Use these product shots", files } });
+    assertEquals(sent, [{ message: "Use these product shots", files }]);
+});
+
+Deno.test({
+    name: "supercool: live reply settles a receipt (shape only)",
+    ignore: liveSkip("supercool"),
+    fn: async () => {
+        const result = await runEndpoint({
+            unit: await testSealedUnit(ID),
+            input: { body: { message: "In one sentence, what can you make?" } },
+            mode: "live",
+        });
+        assertEquals(result.httpStatus, 200);
+        const output = result.output as Record<string, unknown>;
+        assert(typeof output.id === "string" && output.id !== "");
+        assertEquals(output.final, true);
+        assert(typeof output.reply === "string");
+        assertEquals(output.credits_used, undefined); // plucked as the receipt
+        assert(typeof result.usage.evidence.CREDIT === "number");
+    },
 });

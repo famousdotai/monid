@@ -37,7 +37,7 @@ export default defineProvider({
             "decks; documents and reports; songs and voiceovers; and " +
             "research with sources.",
         homepageUrl: "https://supercool.com",
-        docsUrl: "https://supercool.com/api",
+        docsUrl: "https://supercool.com/docs/api",
         categories: ["agents", "video-generation", "image-generation"],
     },
     auth: { inject: presets.auth.bearer() },
